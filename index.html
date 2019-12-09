@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1"><meta name="theme-color" content="black">
+<title>RAYCASTING</title>
+<style>body{background:black;overflow:hidden;margin:0}canvas{width:100%;height:100%}</style>
+</head>
+<body>
+<canvas id="ctx" width="500" height="500"></canvas>
+<script>
+
+let ctxb=document.getElementById("ctx"),
+  ctx=ctxb.getContext("2d");
+ctxb.imageSmoothingEnabled=false;
+ctx.fillStyle="white";
+ctx.strokeStyle="white";
+ctx.lineWidth=2;
+
+let pi=3.14;//Better performance
+let pi2=pi*2;
+
+let zoom=1.5,
+w=window.innerWidth*zoom,h=window.innerHeight*zoom,
+rad=(angle)=>{
+  return angle*(pi/180);
+},
+dis=(x,y,xx,yy)=>{
+  let X=x-xx, Y=y-yy;
+  return Math.sqrt((X*X)+(Y*Y));
+},
+desc={
+  x:0,
+	y:0
+},
+map={
+  w:2000,
+	h:2000
+},
+
+/*== RENDER =============================================*/
+pointAt=(x,y,color="white",r=5)=>{
+  ctx.fillStyle=color;
+  ctx.beginPath();
+  ctx.arc(x+desc.x,y+desc.y,r,0,pi2);
+	ctx.fill();
+},
+drawLine=(a,b,color="white",s=2)=>{
+  ctx.lineWidth=s;
+  ctx.strokeStyle=color;
+  ctx.beginPath();
+  ctx.moveTo(a[0]+desc.x,a[1]+desc.y);
+	ctx.lineTo(b[0]+desc.x,b[1]+desc.y);
+	ctx.stroke();
+},
+gradientRadial=(x1,y1,r1,x2,y2,r2,c1,c2)=>{
+  let g=ctx.createRadialGradient(x1+desc.x,y1+desc.y,r1,x2+desc.x,y2+desc.y,r2);
+	g.addColorStop("0",c1);
+  g.addColorStop("1",c2);
+	return g;
+}
+/*=======================================================*/
+m={
+  touched:false,
+  x:w/2,
+  y:h/2,
+	handle_mobile:null
+},
+c={
+  x:m.x,y:m.y
+};
+
+/*=== CLASS =========================================================================*/
+class point{
+  constructor(x,y){
+	  this.x=x;this.y=y;
+	}
+}
+class line{
+  constructor(a=[0,0],b=[0,0],color="white"){
+	  this.a=a;this.b=b;this.color=color;
+		this.mx=(a[0]+b[0])/2;
+		this.my=(a[1]+b[1])/2;
+		this.s=dis(a[0],a[1],b[0],b[1]);
+		this.pmin={d:0};this.pmax={d:0};
+	}
+	draw(color=null,s=1){
+	  let a0=this.a[0], a1=this.a[1], b0=this.b[0], b1=this.b[1];
+	  this.mx=(a0+b0)/2;
+		this.my=(a1+b1)/2;
+	  this.s=dis(a0,a1,b0,b1);
+	  drawLine(this.a,this.b,color!=null?color:this.color,s);
+	}
+}
+class light{
+  constructor(density=8,size=100,atpos=function(){},color="white"){
+	  this.x=null;this.y=null;this.ls=[];this.color=color;
+		this.d=density;this.s=size;
+		this.atpos=atpos;
+	}
+	draw(xatt=null,yatt){
+	  xatt!=null?this.x=xatt:null;
+		yatt!=null?this.y=yatt:null;
+		this.atpos();
+		let x=this.x, y=this.y, 
+		  ca=0; //first angle
+		for(let i=0;i<this.d;i++){
+			let na=rad(360/this.d),
+			  cosCa=Math.cos(ca), cosNa=Math.cos(na), sinCa=Math.sin(ca), sinNa=Math.sin(na),
+			  b=( this.s*cosCa*cosNa ) - ( this.s*sinCa*sinNa ),
+			  c=( this.s*sinCa*cosNa ) + ( this.s*cosCa*sinNa ),
+		    x2=b+x, y2=c+y, x_,y_, px=x2,py=y2, min, windex=null;
+			ca+=na;
+			for(let w of ws){
+			  let wa0=w.a[0], wa1=w.a[1], wb0=w.b[0], wb1=w.b[1]
+			  x_=( ((x*y2-y*x2)*(wa0-wb0))-((x-x2)*(wa0*wb1-wa1*wb0)) ) / ( ((x-x2)*(wa1-wb1))-((y-y2)*(wa0-wb0)) );
+			  y_=( ((x*y2-y*x2)*(wa1-wb1))-((y-y2)*(wa0*wb1-wa1*wb0)) ) / ( ((x-x2)*(wa1-wb1))-((y-y2)*(wa0-wb0)) );
+				let xm=(x+x2)/2, ym=(y+y2)/2,
+				  dw=dis(w.mx,w.my,x_,y_),
+				  dl=dis(xm,ym,x_,y_),
+				  dc=dis(x,y,x_,y_),
+				  da=dis(wa0,wa1,x_,y_);
+				if(dw<=w.s/2&&dl<=this.s/2){
+				  if(!min||dc<min){
+					  if(w.pmin.d==0||da<w.pmin.d){
+				      w.pmin.x=x_;
+			      	w.pmin.y=y_;
+				    	w.pmin.d=da;
+			      }
+			    	if(w.pmax.d==0||da>w.pmax.d){
+					    w.pmax.x=x_;
+				      w.pmax.y=y_;
+				      w.pmax.d=da;
+				    }
+					  px=x_;
+						py=y_;
+						min=dc;
+						windex=ws.indexOf(w);
+					}
+				}
+			}
+			this.gradient=gradientRadial(this.x,this.y,0,this.x,this.y,this.s*1.15,this.color,"black");
+			drawLine([x,y],[px,py],this.gradient);
+			windex!=null ? ws[windex].col=true :null;
+		}
+	}
+}
+/*=================================================================================*/
+
+let ws=[];
+
+for(let i=0;i<200;i++){
+  let x=Math.random()*map.w;
+	let y=Math.random()*map.h;
+	let hip=Math.random()*200+50;
+	let angle=Math.random()*360;
+	let x2=Math.cos(rad(angle))*hip+x;
+	let y2=Math.sin(rad(angle))*hip+y;
+	let color="#"+parseInt(Math.random()*50+49)+""+parseInt(Math.random()*50+49)+""+parseInt(Math.random()*50+49);
+  ws.push(new line([x,y],[x2,y2],color,1));
+}
+
+let p={
+  x:map.w/2,y:map.h/2,
+	spd:1.1,
+	spd_div:1,
+	ac:0.004,
+  light:new light(1000,0,function(){this.x=p.x;this.y=p.y},"#dfdfff"),
+	mv:function(tx,ty){
+    this.spd_div>1 ?
+		  this.spd_div-=this.ac:
+			this.spd_div=1;
+	  let spd=this.spd/this.spd_div;
+	  let x=this.x;let y=this.y;
+		ty-=2*(ty-y);
+		let tyy=ty-y, txx=tx-x,
+		    m=((tyy)/(txx))*spd;
+		this.x=tx-(tyy)/m;
+		this.y=ty-(txx)*m;
+	}
+}
+
+let wd=w/2, hd=h/2;
+
+function loop(){
+  requestAnimationFrame(loop);
+  p.light.s<400?p.light.s+=10:p.light.s=400;
+	w=window.innerWidth*zoom;h=window.innerHeight*zoom;
+	wd=w/2; hd=h/2;
+	ctxb.width=w;ctxb.height=h;
+	p.x<0?p.x=0:null; p.x>map.w?p.x=map.w:null;
+	p.y<0?p.y=0:null; p.y>map.h?p.y=map.h:null;
+	c.x=p.x;c.y=p.y;
+	desc={
+	  x:wd-c.x,
+		y:hd-c.y
+	}
+	
+	if(m.handle_mobile!=null){
+	  m.x=m.handle_mobile.touches[0].clientX+c.x-(wd)/zoom;
+	  m.y=m.handle_mobile.touches[0].clientY+c.y-(hd)/zoom;
+	}
+	
+	for(let w of ws){
+	  w.pmin.d=0;w.pmax.d=0;
+		w.col=false;
+	}
+	
+	p.light.draw(wd,hd);
+	
+	pointAt(wd-desc.x,hd-desc.y,"black",10);
+	
+	//pointAt(m.x,m.y,"green",5);
+	
+	m.touched ?
+	  p.mv(m.x,m.y):
+		p.spd_div=p.spd;
+  
+	for(let w of ws){
+	  w.draw("black",3);
+	  if(w.pmin.d!=0&&w.pmax.d!=0&&w.col)
+		  drawLine([w.pmin.x,w.pmin.y],[w.pmax.x,w.pmax.y],w.color,3);			
+	}
+	drawLine([0,0],[map.w,0],"white",2);
+  drawLine([0,0],[0,map.h],"white",2);
+	drawLine([map.w,0],[map.w,map.h],"white",2);
+  drawLine([map.w,map.h],[0,map.h],"white",2);
+	
+}
+loop();
+
+ctxb.addEventListener("mousemove",(e)=>{
+  e.preventDefault();
+  m.x=e.clientX+c.x;
+	m.y=e.clientY+c.y;
+});
+ctxb.addEventListener("touchstart",(e)=>{
+  e.preventDefault();
+  m.touched=true;
+	m.handle_mobile=e;
+});
+ctxb.addEventListener("touchend",(e)=>{
+  e.preventDefault();
+  m.touched=false;
+	m.handle_mobile=null;
+});
+ctxb.addEventListener("touchmove",(e)=>{
+  e.preventDefault();
+	m.handle_mobile=e;
+});
+
+</script>
+</body>
+</html>
