@@ -1,663 +1,354 @@
-use std::convert::Infallible;
+use mio::{Events, Interest, Poll, Token};
+use mio::net::{TcpListener, TcpStream};
+use std::net::Shutdown;
+use std::io::{self, Read, Write, ErrorKind, Cursor};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use hyper::{Body, Request, Response, Server, Method};
-use hyper::service::{make_service_fn, service_fn};
-use mongodb::{bson::{doc, Bson, Document, from_bson, oid::ObjectId}, sync::{Client, Collection}};
-use bcrypt::{hash, verify};
-use files_buffer::FilesBuferr;
-use json::JsonValue;
-use rand::{thread_rng, Rng};
-use rand::distributions::Alphanumeric;
-use serde::{Deserialize, Serialize};
-use serde_json;
-use chrono::Utc;
+use sha1::{Sha1, Digest};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
-//next internal server error: 50036
+const LISTENER_EVENT_TOKEN: Token = Token(0);
+const HEADER_WS_0: &'static [u8] = b"Upgrade: websocket";
+const HEADER_WS_1: &'static [u8] = b"Connection: Upgrade";
+const HEADER_WS_2: &'static [u8] = b"Sec-WebSocket-Version: 13";
+const HEADER_WS_3: &'static [u8] = b"Sec-WebSocket-Key";
 
-const TOKEN_SIZE: usize = 32;
+struct Client {
+    socket: TcpStream,
+    //WebSocket HandShake Done
+    wshs: bool,
+    key: Option<String>
+}
 
-const HASH_COST: u32 = 10;
+impl Client {
+    pub fn send(&mut self, data: &[u8]) {
+        if self.wshs {
+            let mut one: u8 = 128;
+            one |= 0x80;
+            one |= 1u8;
 
-const PUBLIC_DIR: &str = "public";
-const ERROR_FILE: &str = "/error404.html";
+            let mut two = 0u8;
 
-async fn handle_get (req: Request<Body>,files: &FilesBuferr)-> Result<Response<Body>, Infallible> {
-    let mut path = req.uri().path();
-    path = match path {
-        "/" => "/index.html",
-        "/analytics" => "/analytics.html",
-        _ => path
-    };
-    match files.buffer.get(path) {
-        Some(file) => return Ok(Response::new(Body::from(file.to_string()))),
-        None => match files.buffer.get(ERROR_FILE) {
-            Some(file) => return Ok(Response::new(Body::from(file.to_string()))),
-            None => return Ok(Response::new(Body::from("Error 5003\r\nFile not found")))
+            match data.len() {
+                len if len < 126 => {
+                    two |= len as u8;
+                }
+                len if len <= 65535 => {
+                    two |= 126;
+                }
+                _ => {
+                    two |= 127;
+                }
+            }
+
+            let mut data_framed: Vec<u8> = Vec::new();
+            let mut w = Cursor::new(&mut data_framed);
+            if let Err(e) = w.write_all(&[one, two]) {panic!("{}", e)};
+
+            if let Some(length_bytes) = match data.len() {
+                len if len < 126 => None,
+                len if len <= 65535 => Some(2),
+                _ => Some(8)
+            } {
+                if let Err(e) = w.write_uint::<BigEndian>(data.len() as u64, length_bytes) {panic!("{}", e)};
+            }
+
+            if let Err(e) = w.write_all(&data) {panic!("{}", e)};
+            
+            println!("Sending: {:?}", &data_framed);
+            if let Err(e) = self.socket.write_all(&data_framed) {
+                println!("Error writing: {}", e);
+            }
+        }else {
+            if let Err(e) = self.socket.write_all(data) {
+                println!("Error writing: {}", e);
+            }
         }
     }
 }
 
-async fn handle_post (
-        req: Request<Body>,
-        users_collection: Collection,
-        streams_collection: Collection,
-        users: Arc<Mutex<HashMap<ObjectId, User>>>,
-        userid_by_token: Arc<Mutex<HashMap<String, ObjectId>>>,
-        token_pass_by_email: Arc<Mutex<HashMap<String, (String, String)>>>,
-        hosts: Arc<Mutex<HashMap<String, ObjectId>>>
-    ) -> Result<Response<Body>, Infallible> {
-        match req.uri().path() {
-            "/users/login" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let email = match body["email"].as_str() {
-                    Some(v) => v,
-                    None => return res("Email is required", 400)
-                };
-                let password = match body["password"].as_str() {
-                    Some(v) => v,
-                    None => return res("Password is required", 400)
-                };
-                let token_passes = token_pass_by_email.lock().unwrap();
-                match token_passes.get(&email.to_string()) {
-                    Some (token_pass) => {
-                        match verify(password.to_string(), &token_pass.1) {
-                            Ok(ismatch) => {
-                                if ismatch {
-                                    return res(token_pass.0.to_string(), 200)
-                                }else{
-                                    return res("Invalid E-mail or password", 400)
-                                }
-                            },
-                            Err (_) => return res("Error 5006", 500)
-                        }
-                    },
-                    None => {
-                        drop(token_passes);
-                        let user = match users_collection.find_one(doc!{ "email" : email }, None) {
-                            Ok (user) => {
-                                match user {
-                                    Some (user) => user,
-                                    None => return res("Invalid E-mail or password", 400)
-                                }
-                            },
-                            Err (_) => return res("Error 5004", 500)
-                        };
-                        let hashed = match user.get("password").and_then(Bson::as_str) {
-                            Some (v) => v,
-                            None => return res("Error 50011", 500)
-                        };
-                        let logged = match verify(password, hashed) {
-                            Ok (v) => v,
-                            Err (_) => return res("Error 5009", 500)
-                        };
-                        if logged {
-                            let userid = match user.get("_id").and_then(Bson::as_object_id) {
-                                Some (v) => v,
-                                None => return res("Error 50015", 500)
-                            };
-                            let mut userid_by_token = userid_by_token.lock().unwrap();
-                            let token = generate_token(&userid_by_token);
-                            userid_by_token.insert(token.to_string(), userid.clone());
-                            drop(userid_by_token);
-                            users.lock().unwrap().insert(userid.clone(), User {
-                                id: userid.clone(),
-                                email: email.to_string(),
-                                username: user.get("username").and_then(Bson::as_str).unwrap().to_string(),
-                                pass_hashed: hashed.to_string(),
-                                games: get_games_from_user(&user),
-                                host: false,
-                                host_sub_server: 0
+fn main() {
+
+    let addr = "127.0.0.1:80".parse().unwrap();
+
+    let mut poll = Poll::new().unwrap();
+
+    let mut listener = TcpListener::bind(addr).unwrap();
+    poll.registry().register(&mut listener, LISTENER_EVENT_TOKEN, Interest::READABLE).unwrap();
+
+    let mut clients_length = 0;
+    let mut clients: HashMap<Token, Client> = HashMap::new();
+
+    let mut events = Events::with_capacity(1024);
+    loop {
+        poll.poll(&mut events, None).unwrap();
+        for event in events.iter() {
+            match event.token() {
+                LISTENER_EVENT_TOKEN => {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            clients_length += 1;
+                            let token = Token(clients_length);
+                            poll.registry().register(
+                                &mut socket,
+                                token,
+                                Interest::READABLE
+                            ).unwrap();
+                            clients.insert(token, Client {
+                                socket,
+                                wshs: false,
+                                key: None
                             });
-                            token_pass_by_email.lock().unwrap().insert(email.to_string(), (token.clone(), hashed.to_string()));
-                            return res(token, 200)
-                        } else {
-                            return res("Invalid E-mail or password", 400)
-                        }
-                    }
-                }
-            }
-            "/users/register" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let email = match body["email"].as_str() {
-                    Some(email) => {
-                        if is_email_valid(email) {
-                            email
-                        } else {
-                            return res("E-mail not valid", 400)
-                        }
-                    },
-                    None => return res("Email is required", 400)
-                };
-                match users_collection.find_one(doc!{ "email" : email }, None) {
-                    Ok (user) => {
-                        if let Some(_) = user {
-                            return res("E-mail is already in use", 400)
-                        }
-                    },
-                    Err (_) => return res("Error 5005", 500)
-                }
-                let password = match body["password"].as_str() {
-                    Some(v) => {
-                        if v.len() < 5 {
-                            return res("Password is too short", 400)
-                        } else {
-                            v
-                        }
-                    },
-                    None => return res("Password is required", 400)
-                };
-                let username = match body["username"].as_str() {
-                    Some(v) => {
-                        if v.len() < 5 {
-                            return res("Username is too short", 400)
-                        } else {
-                            v
-                        }
-                    },
-                    None => return res("Username is required", 400)
-                };
-                let password_hashed = match hash(&password, HASH_COST) {
-                    Ok (v) => v,
-                    Err (_) => return res("Error 5001", 500)
-                };
-                match users_collection.insert_one(doc! {
-                    "email": &email,
-                    "username": &username,
-                    "password": &password_hashed,
-                    "games": []
-                }, None) {
-                    Ok (_) => return res("Ok", 200),
-                    Err (_) => return res("Error 5002", 500)
-                }
-            }
-            "/users/me" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                let userid_by_token = userid_by_token.lock().unwrap();
-                let users = users.lock().unwrap();
-                let user = match userid_by_token.get(token) {
-                    Some(userid) => {
-                        match users.get(userid) {
-                            Some (v) => v,
-                            None => return res("Error 50017", 500)
-                        }
-                    },
-                    None => return res("Invalid token", 400)
-                };
-                drop(userid_by_token);
-                let games_json = serde_json::to_string(&user.games).unwrap_or_default();
-                return res(format!(
-                    "{{\"email\":\"{}\",\"username\":\"{}\",\"games\":{}}}",
-                    user.email, user.username, games_json
-                ), 200)
-            }
-            "/users/host/games/add" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                let name = match body["name"].as_str() {
-                    Some(v) => v,
-                    None => return res("Name is required", 400)
-                };
-                let path = match body["path"].as_str() {
-                    Some(v) => v,
-                    None => return res("Path is required", 400)
-                };
-                let icon = match body["icon"].as_str() {
-                    Some(v) => v,
-                    None => ""
-                };
-                let userid_by_token = userid_by_token.lock().unwrap();
-                let mut users = users.lock().unwrap();
-                let user = match userid_by_token.get(token) {
-                    Some(userid) => {
-                        match users.get_mut(userid) {
-                            Some (v) => v,
-                            None => return res("Error 50021", 500)
-                        }
-                    },
-                    None => return res("Invalid token", 400)
-                };
-                drop(userid_by_token);
-                for game in &user.games {
-                    if game.name == name {
-                        return res("Game with the same name already exist", 400)
-                    }
-                }
-                user.games.push(Game {
-                    name: name.to_string(),
-                    path: path.to_string(),
-                    icon: icon.to_string()
-                });
-                match users_collection.update_one(
-                    doc!{ "_id" : &user.id }, 
-                    doc!{ "$push" : { "games": {
-                        "name": name,
-                        "path": path,
-                        "icon": icon
-                    } } }, 
-                    None
-                ){
-                    Ok (update_res) => {
-                        if update_res.modified_count > 0 {
-                            return res("Ok", 200)
-                        } else {
-                            if update_res.matched_count < 0{
-                                return res("Error 50013", 500)
-                            } else {
-                                return res("Error 50026", 500)
-                            }
-                        }
-                    },
-                    Err (_) => return res("Error 50023", 500)
-                }
-            }
-            "/users/host/games/remove" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                let name = match body["name"].as_str() {
-                    Some(v) => v,
-                    None => return res("Name is required", 400)
-                };
-                let mut i: usize = 0;
-                let userid_by_token = userid_by_token.lock().unwrap();
-                let mut users = users.lock().unwrap();
-                let user = match userid_by_token.get(token) {
-                    Some(userid) => {
-                        match users.get_mut(userid) {
-                            Some (v) => v,
-                            None => return res("Error 50018", 500)
-                        }
-                    },
-                    None => return res("Invalid token", 400)
-                };
-                drop(userid_by_token);
-                match user.games.len() {
-                    0usize => return res("Ok", 200),
-                    1usize => {
-                        user.games.clear();
-                        match users_collection.update_one(
-                            doc!{ "_id" : &user.id }, 
-                            doc!{ "$set" : { "games": [] } },
-                            None
-                        ) {
-                            Ok (update_res) => {
-                                if update_res.modified_count > 0 {
-                                    return res("Ok", 200)
-                                } else {
-                                    return res("Error 5008", 500)
-                                }
-                            },
-                            Err (_) => return res("Error 5007", 500)
-                        }
-                    },
-                    _ => {
-                        for game in user.games.iter() {
-                            if game.name == name {
-                                break;
-                            }
-                            i = i + 1;
-                        }
-                        user.games.remove(i);
-                        match users_collection.update_one(
-                            doc!{ "_id" : &user.id }, 
-                            doc!{ "$pull" : { "games": { "name" : name } } },
-                            None
-                        ) {
-                            Ok (update_res) => {
-                                if update_res.modified_count > 0 {
-                                    return res("Ok", 200)
-                                } else {
-                                    return res("Error 50012", 500)
-                                }
-                            },
-                            Err (_) => return res("Error 50025", 500)
-                        }
-                    }
-                }
-            }
-            "/users/host/start" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                let host_sub_server = match body["host_sub_server"].as_u16() {
-                    Some(v) => v,
-                    None => return res("host_sub_server is required", 400)
-                };
-                match userid_by_token.lock().unwrap().get(token) {
-                    Some (userid) => {
-                        match users.lock().unwrap().get_mut(userid) {
-                            Some (user) => {
-                                user.host_sub_server = host_sub_server;
-                                hosts.lock().unwrap().insert(token.to_string(), userid.clone());
-                                return res("Ok", 200);
-                            },
-                            None => return res("Error 50019", 500)
-                        }
-                    },
-                    None => return res("Invalid token", 400)
-                }
-            }
-            "/users/host/stop" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                hosts.lock().unwrap().remove(token);
-                return res("Ok", 200)
-            }
-            "/users/host/list" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let start = match body["start"].as_u16() {
-                    Some(v) => v,
-                    None => return res("Start is required", 400)
-                };
-                let mut i: u16 = start;
-                let mut response: String = String::from('[');
-                let mut end = match body["end"].as_u16() {
-                    Some(v) => v,
-                    None => return res("End is required", 400)
-                };
-                end = end - 1;
-                let hosts = hosts.lock().unwrap();
-                let hosts_len = hosts.len() as u16;
-                if end - start > 20 {
-                    end = start + 20;
-                }
-                if end > hosts_len{
-                    end = hosts_len;
-                }
-                let users = users.lock().unwrap();
-                for host in hosts.iter() {
-                    if i >= end {
-                        break;
-                    }
-                    let user = users.get(host.1).unwrap();
-                    let games_json = match serde_json::to_string(&user.games) {
-                        Ok (v) => v,
-                        Err (_) => return res("Error 50016", 500)
-                    };
-                    response = format!(
-                        "{}{{\
-                            \"id\":\"{}\",\
-                            \"username\":\"{}\",\
-                            \"host_sub_server\":{},\
-                            \"games\":{}\
-                        }}",
-                        response,
-                        user.id,
-                        user.username,
-                        user.host_sub_server,
-                        games_json
-                    );
-                    if i < end - 1 {
-                        response.push(',');
-                    }
-                    i = i + 1;
-                }
-                drop(users);
-                drop(hosts);
-                response.push(']');
-                return res(response, 200)
-            }
-            "/users/host/req" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                let machine_id = match body["machine_id"].as_str() {
-                    Some(v) => match ObjectId::with_string(v) {
-                        Ok(v) => v,
-                        Err(_) => return res("Machine id is invalid", 400)
-                    },
-                    None => return res("Machine id is required", 400)
-                };
-                let game_name = match body["game_name"].as_str() {
-                    Some(v) => v,
-                    None => return res("Game name is required", 400)
-                };
-                let users = users.lock().unwrap();
-                let game_path: String = match users.get(&machine_id) { 
-                    Some (machine) => {
-                        match machine.games.iter().find(|&x| x.name == game_name) {
-                            Some (v) => v.path.clone(),
-                            None => return res("Game name is invalid", 400)
-                        }
-                    },
-                    None => return res("Machine id is invalid", 400)
-                };
-                drop(users);
-                let userid = match userid_by_token.lock().unwrap().get(token) {
-                    Some(v) => v.clone(),
-                    None => return res("User id is invalid", 400)
-                };
-                match streams_collection.find_one(doc!{
-                    "_id" : &userid
-                }, None) {
-                    Ok (found) => {
-                        if let Some(_) = found {
-                            return res("Already in stream", 400)
-                        }
-                    },
-                    Err (_) => return res("Error 50034", 400)
-                }
-                match streams_collection.insert_one(doc!{
-                    "_id" : userid,
-                    "host_id" : machine_id,
-                    "game_name" : game_name,
-                    "path": game_path,
-                    "started_at": Utc::now(),
-                    "resolution": "640x480"
-                }, None) {
-                    Ok (_) => return res("Ok", 200),
-                    Err (_) => return res("Error 50033", 500)
-                }
-            },
-            "/users/host/req/stop" => {
-                let body = match get_body(req).await {
-                    Some(v) => v,
-                    None => return res("Invalid body", 400)
-                };
-                let token = match body["token"].as_str() {
-                    Some(v) => v,
-                    None => return res("Token is required", 400)
-                };
-                let userid = match userid_by_token.lock().unwrap().get(token) {
-                    Some(v) => v.clone(),
-                    None => return res("User id is invalid", 400)
-                };
-                if let Err(_) = streams_collection.delete_one(doc!{
-                    "_id" : userid
-                }, None) {
-                    return res("Error 50035", 400)
-                };
-                return res("Ok", 200)
-            }
-            _ => res("Path not found", 404)
-        }
-}
-
-#[tokio::main]
-async fn main() {
-    println!("Connecting to mongodb ...");
-
-    let client = match Client::with_uri_str("mongodb+srv://user:JmkqeB7umZy9ic3h@cluster0.z2y7d.mongodb.net/") {
-        Ok(result) => {
-            result
-        },
-        Err(err) => {
-            panic!("{}",err);
-        }
-    };
-    let db = client.database("usersdb");
-    let users_collection = db.collection("users");
-    let streams_collection = db.collection("streams");
-
-    println!("Buffering public files ...");
-    let files = Arc::new(FilesBuferr::new(PUBLIC_DIR));
-
-    let users: Arc<Mutex<HashMap<ObjectId, User>>> = Arc::new(Mutex::new(HashMap::new()));
-    let userid_by_token: Arc<Mutex<HashMap<String, ObjectId>>> = Arc::new(Mutex::new(HashMap::new()));
-    let tokenpass_by_email: Arc<Mutex<HashMap<String, (String, String)>>> = Arc::new(Mutex::new(HashMap::new()));
-    let hosts: Arc<Mutex<HashMap<String, ObjectId>>> = Arc::new(Mutex::new(HashMap::new()));
-    
-    println!("Starting server ...");
-    let make_svc = make_service_fn(move |_| {
-        let users_collection = users_collection.clone();
-        let streams_collection = streams_collection.clone();
-        let users = users.clone();
-        let userid_by_token = userid_by_token.clone();
-        let tokenpass_by_email = tokenpass_by_email.clone();
-        let hosts = hosts.clone();
-        let files = files.clone();
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let users_collection = users_collection.clone();
-                let streams_collection = streams_collection.clone();
-                let users = users.clone();
-                let userid_by_token = userid_by_token.clone();
-                let tokenpass_by_email = tokenpass_by_email.clone();
-                let hosts = hosts.clone();
-                let files = files.clone();
-                async move {
-                    match req.method() {
-                        &Method::GET => handle_get(req, files.as_ref()).await,
-                        &Method::POST => {
-                            handle_post(
-                                req,
-                                users_collection,
-                                streams_collection,
-                                users,
-                                userid_by_token,
-                                tokenpass_by_email,
-                                hosts
-                            ).await
+                            poll.registry().reregister(&mut listener, LISTENER_EVENT_TOKEN, Interest::READABLE).unwrap();
                         },
-                        _ => res("Invalid method", 404)
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("Unexpected error: {}", e)
+                    }
+                },
+                token => {
+                    let mut buff = [0; 2048];
+                    let mut buff_len = 0;
+                    let stream_close: bool = 
+                        if let Some(client) = clients.get_mut(&token) {
+                            loop {
+                                match client.socket.read(&mut buff) {
+                                    Ok(0) => break true,
+                                    Ok(len) => {
+                                        buff_len = len;
+                                        break false
+                                    },
+                                    Err(e) => break match e.kind() {
+                                        ErrorKind::WouldBlock => false,
+                                        ErrorKind::ConnectionReset | _ => true
+                                    }
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                    if stream_close {
+                        println!("Client destroyed");
+                        let mut client = match clients.remove(&token) {
+                            Some(v) => v,
+                            None => panic!("Client not found")
+                        };
+                        if let Err(e) = client.socket.shutdown(Shutdown::Both) {
+                            println!("Error shutting down connection: {}", e)
+                        }
+                        poll.registry().deregister(
+                            &mut client.socket
+                        ).unwrap();
+                    } else {
+                        if let Some(client) = clients.get_mut(&token) {
+                            let data = &buff[0..buff_len];
+                            if client.wshs && buff_len > 2{
+                                if let Some(text) = parse_data(data) {
+                                    println!("Received: {}", String::from_utf8_lossy(&text));
+                                    client.send(b"test");
+                                }
+                            }else{
+                                if let Some(key) = search_ws_headers(data) {
+                                    let mut hasher = Sha1::new();
+                                    hasher.update(&key);
+                                    hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                                    let hashed = base64::encode(hasher.finalize());
+                                    client.send(format!(
+                                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept:{}\r\n\r\n",
+                                        &hashed
+                                    ).as_bytes());
+                                    client.key = Some(hashed);
+                                    client.wshs = true;
+                                    println!("New WS Connection");
+                                }else {
+                                    println!("No WS headers found");
+                                }
+                            }
+                            poll.registry().reregister(
+                                &mut client.socket,
+                                token,
+                                Interest::READABLE
+                            ).unwrap();
+                        }
                     }
                 }
-            }))
-        }
-    });
-
-    let addr = ([127, 0, 0, 1], 7878).into();
-
-    let server = Server::bind(&addr).serve(make_svc);
-    println!("Server running.");
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Game {
-    pub name: String,
-    pub path: String,
-    pub icon: String
-}
-
-struct User {
-    pub id: ObjectId,
-    pub email: String,
-    pub username: String,
-    pub pass_hashed: String,
-    pub games: Vec<Game>,
-    pub host: bool,
-    pub host_sub_server: u16
-}
-
-fn is_email_valid (email: &str) -> bool {
-    let mut atsign: bool = false;
-    for c in email.chars() {
-        match c {
-            '{' | '}' | '=' | ':' | ',' | ';' | '"' | '\'' | '\\' | '/' => return false,
-            '@' => {
-                if atsign {return false}
-                atsign = true
-            },
-            _ => {}
+            }
         }
     }
-    return atsign
 }
 
-async fn get_body (req: Request<Body>) -> Option<JsonValue> {
-    match hyper::body::to_bytes(req.into_body()).await {
-        Ok (_body) => {
-            let b = String::from_utf8_lossy(&_body);
-            match json::parse(&b) {
-                Ok (body) => return Some(body),
-                Err (_) => return None
+fn search_ws_headers(data: &[u8]) -> Option<Vec<u8>> {
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    let mut header_0_found = false;
+    let mut header_1_found = false;
+    let mut header_2_found = false;
+    let mut header_3_found = false;
+    let mut key: Option<Vec<u8>> = None;
+    for d in data {
+        if *d == '\r' as u8 {
+            if i > 0 {
+                i += 2;
+            }
+            let line = &data[i..j];
+            if !header_0_found {
+                if line == HEADER_WS_0 {
+                    header_0_found = true;
+                }
+            }
+            if !header_1_found {
+                if line == HEADER_WS_1 {
+                    header_1_found = true;
+                }
+            }
+            if !header_2_found {
+                if line == HEADER_WS_2 {
+                    header_2_found = true;
+                }
+            }
+            if !header_3_found {
+                let len = line.len();
+                if len > 19 && &line[0..17] == HEADER_WS_3 {
+                    header_3_found = true;
+                    key = Some(Vec::from(&line[19..len]));
+                }
+            }
+            i = j;
+        }
+        j += 1;
+    }
+    if header_0_found && header_1_found && header_2_found {
+        if let Some(key) = key {
+            return Some(key)
+        }
+    }
+    None
+}
+
+pub fn parse_data(_data: &[u8]) -> Option<Vec<u8>> {
+    let mut cursor = Cursor::new(_data);
+
+    cursor.set_position(2);
+
+    let first = _data[0];
+    let second = _data[1];
+    let rsv1 = first & 0b1000000 != 0;
+    let rsv2 = first & 0b100000 != 0;
+    let rsv3 = first & 0b10000 != 0;
+    let opcode = first & 0b1111;
+
+    if second & 0b10000000 == 0 {
+        return None
+    }
+
+    let mut header_length = 2;
+
+    let mut length = u64::from(second & 0b1111111);
+    if let Some(length_nbytes) = match length {
+        126 => Some(2),
+        127 => Some(8),
+        _ => None,
+    } {
+        match cursor.read_uint::<BigEndian>(length_nbytes) {
+            Ok(read) => length = read,
+            Err(ref err) if err.kind() == ErrorKind::UnexpectedEof => {
+                return None;
+            }
+            Err(_) => return None
+        };
+        header_length += length_nbytes as u64;
+    }
+
+    let mut mask_bytes = [0u8; 4];
+    let mask = match cursor.read(&mut mask_bytes) {
+        Ok(v) => {
+            if v != 4 {
+                return None;
+            } else {
+                header_length += 4;
+                Some(mask_bytes)
             }
         },
         Err (_) => return None
+    };
+
+    match length.checked_add(header_length) {
+        Some(l) if l > _data.len() as u64 => {
+            return None;
+        }
+        Some(_) => (),
+        None => return None
+    };
+
+    let mut data = vec![0u8; length as usize];
+    if length > 0 {
+        match cursor.read(&mut data) {
+            Ok(v) => if v != length as usize {
+                return None;
+            },
+            Err(_) => return None
+        }
     }
+
+    // Allow only text opcode
+    if opcode != 1 {
+        return None;
+    }
+
+    let mut one: u8 = 128;
+    if rsv1 {
+        one |= 0b1000000;
+    }
+    if rsv2 {
+        one |= 0b100000;
+    }
+    if rsv3 {
+        one |= 0b10000;
+    }
+    one |= opcode;
+
+    let mut two = 0u8;
+    if mask.is_some() {
+        two |= 0b10000000;
+    }
+
+    match data.len() {
+        len if len < 126 => {
+            two |= len as u8;
+        }
+        len if len <= 65535 => {
+            two |= 126;
+        }
+        _ => {
+            two |= 127;
+        }
+    }
+
+    let mut w = Cursor::new(Vec::with_capacity(length as usize));
+    if let Err(_) = w.write_all(&[one, two]) {return None};
+
+    if let Some(length_bytes) = match length {
+        len if len < 126 => None,
+        len if len <= 65535 => Some(2),
+        _ => Some(8)
+    } {
+        if let Err(_) = w.write_uint::<BigEndian>(data.len() as u64, length_bytes) {return None};
+    }
+
+    if let Some(mask) = mask {
+        let iter = data.iter_mut().zip(mask.iter().cycle());
+        for (byte, &key) in iter {
+            *byte ^= key
+        }
+    }
+
+    return Some(data)
 }
 
-fn get_token () -> String {
-    format!("{:?}", thread_rng().sample_iter(&Alphanumeric).take(TOKEN_SIZE).collect::<Vec<u8>>())
-}
-fn generate_token (users: &HashMap<String, ObjectId>) -> String {
-    let mut token: String = get_token();
-    while users.contains_key(&token) {
-        token = get_token();
-    }
-    token
-}
-
-fn get_games_from_user (user: &Document) -> Vec<Game> {
-    let mut games: Vec<Game> = Vec::new();
-    match user.get("games").and_then(Bson::as_array) {
-        Some (games_doc) => {
-            for game_bson in games_doc {
-                let game: Game = from_bson(game_bson.clone()).unwrap();
-                games.push(game)
-            }
-        }, None => {}
-    }
-    games
-}
-
-fn res<S: AsRef<str>>(data: S, status: u16) -> std::result::Result<hyper::Response<hyper::Body>, std::convert::Infallible>{
-    Ok(Response::builder().status(status).body(hyper::Body::from(data.as_ref().to_string())).unwrap())
-}
+/* 
+    0 => Continue,
+    1 => Text,
+    2 => Binary,
+    8 => Close,
+    9 => Ping,
+    10 => Pong,
+    _ => Bad
+*/
